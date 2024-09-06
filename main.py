@@ -1,5 +1,6 @@
 import time
 from datetime import datetime
+import numpy as np
 import queue
 import threading
 from arena_api.enums import PixelFormat
@@ -9,7 +10,7 @@ from arena_api.__future__.save import Writer
 from multiprocessing import Value
 
 SYS_TL_MAP = system.tl_system_nodemap
-PTP_DELTA = 10000000  # 10ms
+PTP_DELTA = 10000000  # 10ms, may be too tight on slower systems?
 
 
 # Set all relevant config for a device
@@ -29,6 +30,9 @@ def configure_camera(device, id=0):
     # Set Exposure mode and Exposure time (Manual, 30ms)
     dev_map["ExposureAuto"].value = "Off"
     dev_map["ExposureTime"].value = 30000.0
+
+    dev_map["GainAuto"].value = "Off"
+    dev_map["Gain"].value = 3.0  # 12db gain
 
     dev_map["AcquisitionMode"].value = "Continuous"
 
@@ -60,8 +64,6 @@ def configure_camera(device, id=0):
 
     # Resilience gud.
     tl_map["StreamPacketResendEnable"].value = True
-
-    print(" | OK")
 
 
 # Wait until there is exactly one master node
@@ -111,9 +113,13 @@ def fire_cameras(devices, buffer_queue, batch=0):
             device.nodemap["TransferStart"].execute()
             buffer = device.get_buffer(timeout=500)
             device.nodemap["TransferStop"].execute()
-            print(".", end="", flush=True)
+            # print(".", end="", flush=True)
             # Copy buffer into save queue
             serial = device.nodemap["DeviceSerialNumber"].value
+            data = np.ctypeslib.as_array(buffer.pdata,shape=(buffer.height, buffer.width, buffer.bits_per_pixel // 8)).view(np.uint16) >> 4
+            saturated_percent = (data == 4095).sum()/  (data.size) * 100
+            if saturated_percent > 2:
+                print(f"WARN ({serial}): {saturated_percent :.2f}% saturated pixels")
             buffer_queue.put((BufferFactory.copy(buffer), batch, serial))
 
             device.requeue_buffer(buffer)
@@ -134,11 +140,15 @@ def save_image_buffers(buffer_queue, to_do):
         while not buffer_queue.empty():
             buffer, batch, serial = buffer_queue.get()
             # converted = BufferFactory.convert(buffer, PixelFormat.BayerRG16)
+            # writer.save(
+            #     buffer,
+            #     f"images/{sessionID}/Scene_{batch:03}/cam_{serial}.raw",
+            # )
             writer.save(
                 buffer,
-                f"images/{sessionID}/Scene_{batch:03}/cam_{serial}.raw",
+                f"images/{sessionID}/Scene_{batch:03}/cam_{serial}.png",
             )
-            
+
             # print("*", end="", flush=True)
         time.sleep(1)
 
@@ -158,8 +168,10 @@ if __name__ == "__main__":
         try:
             configure_camera(device, id)
         except Exception as e:
+            print(f"Error configuring camera: {device.nodemap['DeviceSerialNumber'].value}")
             print(e)
         id += 1
+    print(" | OK")
 
     # Setup for action commands
     SYS_TL_MAP["ActionCommandDeviceKey"].value = 1
@@ -188,6 +200,9 @@ if __name__ == "__main__":
     while input("Press enter to capture, or q then enter to exit") != "q":
         fire_cameras(devices, buffer_queue, batch)
         batch += 1
+    
+    if to_do_signal.value == 1:
+        print("Please wait while remaining images are saved...")
 
     # Signal that there is no further work coming, and join the consumer thread
     to_do_signal.value = 0
@@ -196,3 +211,5 @@ if __name__ == "__main__":
     # --== Cleanup ==--
     # Destroy all created devices (optional, apparently)
     system.destroy_device()
+
+    print("Done!")
